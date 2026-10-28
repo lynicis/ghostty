@@ -5771,20 +5771,25 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
 
             const screen: *terminal.Screen = self.io.terminal.screens.active;
             const sel = if (screen.selection) |*sel| sel else blk: {
-                // Word adjustments create a zero-width selection at the
-                // cursor so word selection can start without an existing
-                // selection. Other adjustments do not perform, allowing
-                // the keybind to fall through to the terminal.
-                switch (direction) {
-                    .word_left, .word_right => {
-                        const cursor_pin = screen.cursor.page_pin.*;
-                        try screen.select(
-                            terminal.Selection.init(cursor_pin, cursor_pin, false),
-                        );
-                        break :blk &screen.selection.?;
-                    },
-                    else => return false,
-                }
+                // Without a selection, adjustments anchor a new zero-width
+                // selection at the cursor so selection can start without
+                // click-dragging. Word adjustments always anchor because
+                // terminal applications don't bind opt+shift+arrows; other
+                // adjustments anchor only when shell integration marks the
+                // cursor in an input region, so keys that terminal
+                // applications do bind (shift+arrows in vim) still reach
+                // them and the keybind falls through to the terminal.
+                const anchor = switch (direction) {
+                    .word_left, .word_right => true,
+                    else => screen.cursor.semantic_content == .input,
+                };
+                if (!anchor) return false;
+
+                const cursor_pin = screen.cursor.page_pin.*;
+                try screen.select(
+                    terminal.Selection.init(cursor_pin, cursor_pin, false),
+                );
+                break :blk &screen.selection.?;
             };
             sel.adjust(screen, switch (direction) {
                 .left => .left,
