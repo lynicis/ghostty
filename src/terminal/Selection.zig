@@ -1360,6 +1360,81 @@ test "Selection: adjust word_right crosses soft wrap" {
     } }, s.pages.pointFromPin(.screen, sel.end()).?);
 }
 
+test "Selection: adjust word_left crosses soft wrap" {
+    const testing = std.testing;
+    var s = try Screen.init(testing.io, testing.allocator, .{ .cols = 5, .rows = 3, .max_scrollback_bytes = 0 });
+    defer s.deinit();
+    try s.testWriteString("abcdefg");
+
+    const boundary = &[_]u21{ ' ', '\t' };
+
+    // Row 0 is full and wraps into row 1, so "abcdefg" is one word
+    // across a soft wrap.
+    try testing.expect(s.pages.pin(.{ .screen = .{ .x = 4, .y = 0 } }).?.rowAndCell().row.wrap);
+
+    // From "g" the walk reaches the start of the word on row 0.
+    {
+        var sel = Selection.init(
+            s.pages.pin(.{ .screen = .{ .x = 4, .y = 1 } }).?,
+            s.pages.pin(.{ .screen = .{ .x = 1, .y = 1 } }).?,
+            false,
+        );
+        defer sel.deinit(&s);
+        sel.adjust(&s, .word_left, boundary);
+
+        try testing.expectEqual(point.Point{ .screen = .{
+            .x = 0,
+            .y = 0,
+        } }, s.pages.pointFromPin(.screen, sel.end()).?);
+    }
+}
+
+test "Selection: adjust word_left skips boundary at soft wrap seam" {
+    const testing = std.testing;
+    var s = try Screen.init(testing.io, testing.allocator, .{ .cols = 5, .rows = 3, .max_scrollback_bytes = 0 });
+    defer s.deinit();
+    try s.testWriteString("abcde fg");
+
+    const boundary = &[_]u21{ ' ', '\t' };
+
+    // Row 1 starts with a boundary space right after the wrap seam.
+    try testing.expect(s.pages.pin(.{ .screen = .{ .x = 4, .y = 0 } }).?.rowAndCell().row.wrap);
+
+    // From "f" the walk skips the boundary at the seam and crosses the
+    // soft wrap to the start of "abcde".
+    {
+        var sel = Selection.init(
+            s.pages.pin(.{ .screen = .{ .x = 4, .y = 1 } }).?,
+            s.pages.pin(.{ .screen = .{ .x = 1, .y = 1 } }).?,
+            false,
+        );
+        defer sel.deinit(&s);
+        sel.adjust(&s, .word_left, boundary);
+
+        try testing.expectEqual(point.Point{ .screen = .{
+            .x = 0,
+            .y = 0,
+        } }, s.pages.pointFromPin(.screen, sel.end()).?);
+    }
+
+    // From "g" the boundary at the seam stops the walk at the start of
+    // "fg"; the walk does not cross.
+    {
+        var sel = Selection.init(
+            s.pages.pin(.{ .screen = .{ .x = 4, .y = 1 } }).?,
+            s.pages.pin(.{ .screen = .{ .x = 2, .y = 1 } }).?,
+            false,
+        );
+        defer sel.deinit(&s);
+        sel.adjust(&s, .word_left, boundary);
+
+        try testing.expectEqual(point.Point{ .screen = .{
+            .x = 1,
+            .y = 1,
+        } }, s.pages.pointFromPin(.screen, sel.end()).?);
+    }
+}
+
 test "Selection: order, standard" {
     const testing = std.testing;
     const alloc = testing.allocator;
