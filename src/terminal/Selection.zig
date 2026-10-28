@@ -413,6 +413,10 @@ pub const Adjustment = lib.Enum(lib.target, &.{
 
 /// Adjust the selection by some given adjustment. An adjustment allows
 /// a selection to be expanded slightly left, right, up, down, etc.
+///
+/// Word adjustments use boundary_codepoints, the codepoints that mark
+/// word boundaries, and require it to be non-null; all other adjustments
+/// ignore it.
 pub fn adjust(
     self: *Selection,
     s: *const Screen,
@@ -511,118 +515,71 @@ pub fn adjust(
 
         .end_of_line => end_pin.x = end_pin.node.cols() - 1,
 
-        .word_left => {
-            const codepoints = boundary_codepoints orelse return;
-            var it = end_pin.cellIterator(.left_up, null);
-            _ = it.next(); // skip current cell
+        .word_left => adjustWord(
+            end_pin,
+            .left_up,
+            boundary_codepoints.?,
+        ),
 
-            // Phase 1: skip boundary characters (whitespace/punctuation) going left.
-            // Empty cells and hard line breaks (non-wrapped rows) are treated
-            // as hard boundaries, consistent with selectWord in Screen.zig.
-            var last_non_boundary: ?Pin = null;
-            while (it.next()) |next| {
-                const rac = next.rowAndCell();
-
-                // Stop at hard line breaks (landing on last col of a non-wrapped row)
-                if (next.x == next.node.cols() - 1 and !rac.row.wrap) break;
-
-                // Null means an empty cell, a hard boundary like selectWord.
-                const codepoint = Screen.selectWordCodepoint(next) orelse break;
-
-                const is_boundary = std.mem.indexOfScalar(
-                    u21,
-                    codepoints,
-                    codepoint,
-                ) != null;
-                if (!is_boundary) {
-                    last_non_boundary = next;
-                    break;
-                }
-            }
-
-            // Phase 2: skip non-boundary characters (word body) going left
-            // to find the start of the word.
-            if (last_non_boundary != null) {
-                while (it.next()) |next| {
-                    const rac = next.rowAndCell();
-
-                    // Stop at hard line breaks
-                    if (next.x == next.node.cols() - 1 and !rac.row.wrap) break;
-
-                    // Null means an empty cell, a hard boundary like selectWord.
-                    const codepoint = Screen.selectWordCodepoint(next) orelse break;
-
-                    const is_boundary = std.mem.indexOfScalar(
-                        u21,
-                        codepoints,
-                        codepoint,
-                    ) != null;
-                    if (is_boundary) break;
-                    last_non_boundary = next;
-                }
-            }
-
-            if (last_non_boundary) |pos| {
-                end_pin.* = pos;
-            }
-        },
-
-        .word_right => {
-            const codepoints = boundary_codepoints orelse return;
-            var it = end_pin.cellIterator(.right_down, null);
-            _ = it.next(); // skip current cell
-
-            // Phase 1: skip boundary characters (whitespace/punctuation) going right.
-            // Empty cells and hard line breaks (non-wrapped rows) are treated
-            // as hard boundaries, consistent with selectWord in Screen.zig.
-            var last_non_boundary: ?Pin = null;
-            while (it.next()) |next| {
-                const rac = next.rowAndCell();
-
-                // Stop at hard line breaks
-                if (next.x == next.node.cols() - 1 and !rac.row.wrap) break;
-
-                // Null means an empty cell, a hard boundary like selectWord.
-                const codepoint = Screen.selectWordCodepoint(next) orelse break;
-
-                const is_boundary = std.mem.indexOfScalar(
-                    u21,
-                    codepoints,
-                    codepoint,
-                ) != null;
-                if (!is_boundary) {
-                    last_non_boundary = next;
-                    break;
-                }
-            }
-
-            // Phase 2: skip non-boundary characters (word body) going right
-            // to find the end of the word.
-            if (last_non_boundary != null) {
-                while (it.next()) |next| {
-                    const rac = next.rowAndCell();
-
-                    // Stop at hard line breaks
-                    if (next.x == next.node.cols() - 1 and !rac.row.wrap) break;
-
-                    // Null means an empty cell, a hard boundary like selectWord.
-                    const codepoint = Screen.selectWordCodepoint(next) orelse break;
-
-                    const is_boundary = std.mem.indexOfScalar(
-                        u21,
-                        codepoints,
-                        codepoint,
-                    ) != null;
-                    if (is_boundary) break;
-                    last_non_boundary = next;
-                }
-            }
-
-            if (last_non_boundary) |pos| {
-                end_pin.* = pos;
-            }
-        },
+        .word_right => adjustWord(
+            end_pin,
+            .right_down,
+            boundary_codepoints.?,
+        ),
     }
+}
+
+/// Move the selection end one word in the given direction. A word is a
+/// run of codepoints that aren't in `codepoints`, the word-boundary
+/// codepoints. Empty cells and hard line breaks (the end of a non-wrapped
+/// row) always stop the walk, matching Screen.selectWord.
+fn adjustWord(
+    end_pin: *Pin,
+    dir: PageList.Direction,
+    codepoints: []const u21,
+) void {
+    var it = end_pin.cellIterator(dir, null);
+    var prev = it.next() orelse return; // Consume one, our start
+
+    // Phase 1: skip boundary codepoints to find the near edge of the
+    // word in this direction.
+    var edge: ?Pin = null;
+    while (it.next()) |next| {
+        if (crossesHardBreak(dir, prev, next)) break;
+        const codepoint = Screen.selectWordCodepoint(next) orelse break;
+        if (std.mem.indexOfScalar(u21, codepoints, codepoint) == null) {
+            edge = next;
+            prev = next;
+            break;
+        }
+        prev = next;
+    }
+
+    // Phase 2: skip the word body to find the far edge of the word.
+    if (edge != null) {
+        while (it.next()) |next| {
+            if (crossesHardBreak(dir, prev, next)) break;
+            const codepoint = Screen.selectWordCodepoint(next) orelse break;
+            if (std.mem.indexOfScalar(u21, codepoints, codepoint) != null) break;
+            edge = next;
+            prev = next;
+        }
+    }
+
+    if (edge) |pos| end_pin.* = pos;
+}
+
+/// True if moving from `prev` to `next` crosses a hard line break, i.e.
+/// the row being left doesn't wrap. Going right the row being left is
+/// `prev`; going left we land on the previous row's last column, so the
+/// row being entered is `next`.
+fn crossesHardBreak(dir: PageList.Direction, prev: Pin, next: Pin) bool {
+    return switch (dir) {
+        .right_down => prev.x == prev.node.cols() - 1 and
+            !prev.rowAndCell().row.wrap,
+        .left_up => next.x == next.node.cols() - 1 and
+            !next.rowAndCell().row.wrap,
+    };
 }
 
 test "Selection: adjust right" {
@@ -1285,6 +1242,122 @@ test "Selection: adjust word_left with multiple spaces" {
             .y = 0,
         } }, s.pages.pointFromPin(.screen, sel.end()).?);
     }
+}
+
+test "Selection: adjust word_right stops at hard line break" {
+    const testing = std.testing;
+    var s = try Screen.init(testing.io, testing.allocator, .{ .cols = 5, .rows = 3, .max_scrollback_bytes = 0 });
+    defer s.deinit();
+    try s.testWriteString("abcde\nxy");
+
+    const boundary = &[_]u21{ ' ', '\t' };
+
+    // Row 0 is full and not wrapped, so the break after "abcde" is a
+    // hard line break.
+    try testing.expect(!s.pages.pin(.{ .screen = .{ .x = 4, .y = 0 } }).?.rowAndCell().row.wrap);
+
+    // From the middle of "abcde" the word end at the last column is
+    // reached; the hard break is after it, not before it.
+    {
+        var sel = Selection.init(
+            s.pages.pin(.{ .screen = .{ .x = 0, .y = 0 } }).?,
+            s.pages.pin(.{ .screen = .{ .x = 2, .y = 0 } }).?,
+            false,
+        );
+        defer sel.deinit(&s);
+        sel.adjust(&s, .word_right, boundary);
+
+        try testing.expectEqual(point.Point{ .screen = .{
+            .x = 4,
+            .y = 0,
+        } }, s.pages.pointFromPin(.screen, sel.end()).?);
+    }
+
+    // Starting on the last column of a non-wrapped row must not cross
+    // the hard line break into the next row.
+    {
+        var sel = Selection.init(
+            s.pages.pin(.{ .screen = .{ .x = 0, .y = 0 } }).?,
+            s.pages.pin(.{ .screen = .{ .x = 4, .y = 0 } }).?,
+            false,
+        );
+        defer sel.deinit(&s);
+        sel.adjust(&s, .word_right, boundary);
+
+        try testing.expectEqual(point.Point{ .screen = .{
+            .x = 4,
+            .y = 0,
+        } }, s.pages.pointFromPin(.screen, sel.end()).?);
+    }
+}
+
+test "Selection: adjust word_left stops at hard line break" {
+    const testing = std.testing;
+    var s = try Screen.init(testing.io, testing.allocator, .{ .cols = 5, .rows = 3, .max_scrollback_bytes = 0 });
+    defer s.deinit();
+    try s.testWriteString("abcde\nxy");
+
+    const boundary = &[_]u21{ ' ', '\t' };
+
+    // From the middle of "xy" the walk stops at the start of "xy" and
+    // doesn't reach "abcde" on the previous non-wrapped row.
+    {
+        var sel = Selection.init(
+            s.pages.pin(.{ .screen = .{ .x = 4, .y = 1 } }).?,
+            s.pages.pin(.{ .screen = .{ .x = 1, .y = 1 } }).?,
+            false,
+        );
+        defer sel.deinit(&s);
+        sel.adjust(&s, .word_left, boundary);
+
+        try testing.expectEqual(point.Point{ .screen = .{
+            .x = 0,
+            .y = 1,
+        } }, s.pages.pointFromPin(.screen, sel.end()).?);
+    }
+
+    // From the start of "xy" there is no previous word on this line, so
+    // the selection doesn't move across the hard line break.
+    {
+        var sel = Selection.init(
+            s.pages.pin(.{ .screen = .{ .x = 4, .y = 1 } }).?,
+            s.pages.pin(.{ .screen = .{ .x = 0, .y = 1 } }).?,
+            false,
+        );
+        defer sel.deinit(&s);
+        sel.adjust(&s, .word_left, boundary);
+
+        try testing.expectEqual(point.Point{ .screen = .{
+            .x = 0,
+            .y = 1,
+        } }, s.pages.pointFromPin(.screen, sel.end()).?);
+    }
+}
+
+test "Selection: adjust word_right crosses soft wrap" {
+    const testing = std.testing;
+    var s = try Screen.init(testing.io, testing.allocator, .{ .cols = 5, .rows = 3, .max_scrollback_bytes = 0 });
+    defer s.deinit();
+    try s.testWriteString("abcdefg");
+
+    const boundary = &[_]u21{ ' ', '\t' };
+
+    // Row 0 is full and wraps into row 1, so "abcdefg" is one word
+    // across a soft wrap.
+    try testing.expect(s.pages.pin(.{ .screen = .{ .x = 4, .y = 0 } }).?.rowAndCell().row.wrap);
+
+    var sel = Selection.init(
+        s.pages.pin(.{ .screen = .{ .x = 0, .y = 0 } }).?,
+        s.pages.pin(.{ .screen = .{ .x = 2, .y = 0 } }).?,
+        false,
+    );
+    defer sel.deinit(&s);
+    sel.adjust(&s, .word_right, boundary);
+
+    try testing.expectEqual(point.Point{ .screen = .{
+        .x = 1,
+        .y = 1,
+    } }, s.pages.pointFromPin(.screen, sel.end()).?);
 }
 
 test "Selection: order, standard" {
