@@ -5770,11 +5770,21 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             defer self.renderer_state.mutex.unlock(global.io());
 
             const screen: *terminal.Screen = self.io.terminal.screens.active;
-            const sel = if (screen.selection) |*sel| sel else {
-                // If we don't have a selection we do not perform this
-                // action, allowing the keybind to fall through to the
-                // terminal.
-                return false;
+            const sel = if (screen.selection) |*sel| sel else blk: {
+                // Word adjustments create a zero-width selection at the
+                // cursor so word selection can start without an existing
+                // selection. Other adjustments do not perform, allowing
+                // the keybind to fall through to the terminal.
+                switch (direction) {
+                    .word_left, .word_right => {
+                        const cursor_pin = screen.cursor.page_pin.*;
+                        try screen.select(
+                            terminal.Selection.init(cursor_pin, cursor_pin, false),
+                        );
+                        break :blk &screen.selection.?;
+                    },
+                    else => return false,
+                }
             };
             sel.adjust(screen, switch (direction) {
                 .left => .left,
