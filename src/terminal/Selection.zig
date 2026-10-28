@@ -532,7 +532,9 @@ pub fn adjust(
 /// Move the selection end one word in the given direction. A word is a
 /// run of codepoints that aren't in `codepoints`, the word-boundary
 /// codepoints. Empty cells and hard line breaks (the end of a non-wrapped
-/// row) always stop the walk, matching Screen.selectWord.
+/// row) always stop the walk, matching Screen.selectWord. The walk also
+/// never crosses a shell-integration prompt boundary, so word selection
+/// from the cursor doesn't grab the prompt.
 fn adjustWord(
     end_pin: *Pin,
     dir: PageList.Direction,
@@ -545,7 +547,7 @@ fn adjustWord(
     // word in this direction.
     var edge: ?Pin = null;
     while (it.next()) |next| {
-        if (crossesHardBreak(dir, prev, next)) break;
+        if (crossesHardBreak(dir, prev, next) or crossesPrompt(prev, next)) break;
         const codepoint = Screen.selectWordCodepoint(next) orelse break;
         if (std.mem.indexOfScalar(u21, codepoints, codepoint) == null) {
             edge = next;
@@ -558,7 +560,7 @@ fn adjustWord(
     // Phase 2: skip the word body to find the far edge of the word.
     if (edge != null) {
         while (it.next()) |next| {
-            if (crossesHardBreak(dir, prev, next)) break;
+            if (crossesHardBreak(dir, prev, next) or crossesPrompt(prev, next)) break;
             const codepoint = Screen.selectWordCodepoint(next) orelse break;
             if (std.mem.indexOfScalar(u21, codepoints, codepoint) != null) break;
             edge = next;
@@ -580,6 +582,15 @@ fn crossesHardBreak(dir: PageList.Direction, prev: Pin, next: Pin) bool {
         .left_up => next.x == next.node.cols() - 1 and
             !next.rowAndCell().row.wrap,
     };
+}
+
+/// True if moving from `prev` to `next` crosses a shell-integration
+/// prompt boundary, i.e. exactly one of the cells is prompt content.
+/// Word selection never crosses into or out of a prompt.
+fn crossesPrompt(prev: Pin, next: Pin) bool {
+    const prev_prompt = prev.rowAndCell().cell.semantic_content == .prompt;
+    const next_prompt = next.rowAndCell().cell.semantic_content == .prompt;
+    return prev_prompt != next_prompt;
 }
 
 test "Selection: adjust right" {
@@ -1433,6 +1444,84 @@ test "Selection: adjust word_left skips boundary at soft wrap seam" {
             .y = 1,
         } }, s.pages.pointFromPin(.screen, sel.end()).?);
     }
+}
+
+test "Selection: adjust word_left stops at prompt" {
+    const testing = std.testing;
+    var s = try Screen.init(testing.io, testing.allocator, .{ .cols = 40, .rows = 3, .max_scrollback_bytes = 0 });
+    defer s.deinit();
+
+    // Row 0: "user in ~ " is prompt content, "hello world" is input.
+    s.cursor.semantic_content = .prompt;
+    try s.testWriteString("user in ~ ");
+    s.cursor.semantic_content = .input;
+    try s.testWriteString("hello world");
+
+    const boundary = &[_]u21{ ' ', '\t' };
+
+    // Sanity: the prompt and input cells are marked differently.
+    try testing.expectEqual(page.Cell.SemanticContent.prompt, s.pages.pin(.{ .screen = .{ .x = 0, .y = 0 } }).?.rowAndCell().cell.semantic_content);
+    try testing.expectEqual(page.Cell.SemanticContent.input, s.pages.pin(.{ .screen = .{ .x = 11, .y = 0 } }).?.rowAndCell().cell.semantic_content);
+
+    // From the middle of "world" the walk reaches the start of "world".
+    {
+        var sel = Selection.init(
+            s.pages.pin(.{ .screen = .{ .x = 20, .y = 0 } }).?,
+            s.pages.pin(.{ .screen = .{ .x = 17, .y = 0 } }).?,
+            false,
+        );
+        defer sel.deinit(&s);
+        sel.adjust(&s, .word_left, boundary);
+
+        try testing.expectEqual(point.Point{ .screen = .{
+            .x = 16,
+            .y = 0,
+        } }, s.pages.pointFromPin(.screen, sel.end()).?);
+    }
+
+    // From the start of "hello" the walk must not cross into the
+    // prompt, so the selection doesn't move.
+    {
+        var sel = Selection.init(
+            s.pages.pin(.{ .screen = .{ .x = 20, .y = 0 } }).?,
+            s.pages.pin(.{ .screen = .{ .x = 10, .y = 0 } }).?,
+            false,
+        );
+        defer sel.deinit(&s);
+        sel.adjust(&s, .word_left, boundary);
+
+        try testing.expectEqual(point.Point{ .screen = .{
+            .x = 10,
+            .y = 0,
+        } }, s.pages.pointFromPin(.screen, sel.end()).?);
+    }
+}
+
+test "Selection: adjust word_left no move at fresh prompt" {
+    const testing = std.testing;
+    var s = try Screen.init(testing.io, testing.allocator, .{ .cols = 40, .rows = 3, .max_scrollback_bytes = 0 });
+    defer s.deinit();
+
+    // A prompt with nothing typed: the cursor is on the empty cell
+    // right after the prompt.
+    s.cursor.semantic_content = .prompt;
+    try s.testWriteString("user in ~");
+
+    const boundary = &[_]u21{ ' ', '\t' };
+
+    var sel = Selection.init(
+        s.pages.pin(.{ .screen = .{ .x = 9, .y = 0 } }).?,
+        s.pages.pin(.{ .screen = .{ .x = 9, .y = 0 } }).?,
+        false,
+    );
+    defer sel.deinit(&s);
+    sel.adjust(&s, .word_left, boundary);
+
+    // The walk must not select any of the prompt.
+    try testing.expectEqual(point.Point{ .screen = .{
+        .x = 9,
+        .y = 0,
+    } }, s.pages.pointFromPin(.screen, sel.end()).?);
 }
 
 test "Selection: order, standard" {
